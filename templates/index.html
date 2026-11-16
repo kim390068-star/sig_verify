@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Signature Scoring System</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --card: #1a2332;
+      --border: #2d3a4f;
+      --accent: #3b82f6;
+      --accent2: #8b5cf6;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: linear-gradient(145deg, #0f1419 0%, #1a1f2e 50%, #0f1419 100%);
+      color: var(--text);
+      min-height: 100vh;
+      line-height: 1.6;
+    }
+    .container { max-width: 1120px; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+    header { text-align: center; margin-bottom: 2rem; }
+    header h1 {
+      font-size: 1.85rem; font-weight: 700;
+      background: linear-gradient(90deg, #60a5fa, #a78bfa);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+      margin-bottom: 0.4rem;
+    }
+    header p { color: var(--muted); font-size: 0.95rem; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+    @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
+    .card {
+      background: var(--card); border: 1px solid var(--border); border-radius: 16px;
+      padding: 1.5rem; box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+    }
+    .card h2 { font-size: 1.1rem; margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem; }
+    .dropzone {
+      border: 2px dashed var(--border); border-radius: 12px; padding: 2.2rem 1.5rem;
+      text-align: center; cursor: pointer; transition: all 0.25s ease;
+      background: rgba(59, 130, 246, 0.04);
+    }
+    .dropzone:hover, .dropzone.dragover { border-color: var(--accent); background: rgba(59, 130, 246, 0.1); }
+    .dropzone p { color: var(--muted); font-size: 0.9rem; }
+    .dropzone strong { color: var(--accent); }
+    #fileInput { display: none; }
+    .preview-box { margin-top: 1.1rem; text-align: center; display: none; }
+    .preview-box img {
+      max-width: 100%; max-height: 260px; border-radius: 10px;
+      border: 1px solid var(--border); background: #fff; padding: 8px;
+    }
+    .config-box {
+      margin-top: 1.2rem; padding: 1rem; background: rgba(0,0,0,0.2);
+      border-radius: 10px; border: 1px solid var(--border);
+    }
+    .config-box label {
+      display: block; font-size: 0.78rem; color: var(--muted); margin-bottom: 0.25rem; margin-top: 0.6rem;
+    }
+    .config-box label:first-child { margin-top: 0; }
+    .config-box input, .config-box select {
+      width: 100%; padding: 0.5rem 0.7rem; border-radius: 8px;
+      border: 1px solid var(--border); background: #0f1419; color: var(--text);
+      font-size: 0.9rem;
+    }
+    .config-box input:focus { outline: none; border-color: var(--accent); }
+    .hint { font-size: 0.75rem; color: var(--muted); margin-top: 0.35rem; }
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 0.5rem;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      color: white; border: none; border-radius: 10px; padding: 0.75rem 1.5rem;
+      font-size: 1rem; font-weight: 600; cursor: pointer; transition: transform 0.15s, box-shadow 0.15s;
+      width: 100%; margin-top: 1rem;
+    }
+    .btn:hover { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(59,130,246,0.4); }
+    .btn:disabled { opacity: 0.55; cursor: not-allowed; transform: none; box-shadow: none; }
+    .btn.secondary {
+      background: transparent; border: 1px solid var(--border); color: var(--muted); margin-top: 0.55rem;
+    }
+    .result-placeholder { color: var(--muted); text-align: center; padding: 3rem 1rem; font-size: 0.95rem; }
+    .score-ring { width: 140px; height: 140px; margin: 0 auto 1.25rem; position: relative; }
+    .score-ring svg { transform: rotate(-90deg); }
+    .score-ring .value {
+      position: absolute; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; font-size: 2rem; font-weight: 700;
+    }
+    .score-ring .value small { font-size: 0.75rem; font-weight: 500; color: var(--muted); }
+    .badge-group { display: flex; gap: 0.5rem; justify-content: center; flex-wrap: wrap; margin-bottom: 0.75rem; }
+    .badge {
+      display: inline-block; padding: 0.35rem 0.85rem; border-radius: 999px;
+      font-size: 0.85rem; font-weight: 600; background: rgba(59, 130, 246, 0.15);
+      color: #93c5fd; border: 1px solid rgba(59, 130, 246, 0.3);
+    }
+    .badge-secondary {
+      background: rgba(139, 92, 246, 0.15);
+      color: #c4b5fd;
+      border: 1px solid rgba(139, 92, 246, 0.3);
+    }
+    .source-tag {
+      display: inline-block; font-size: 0.72rem; padding: 0.2rem 0.55rem; border-radius: 6px;
+      background: rgba(139, 92, 246, 0.2); color: #c4b5fd; margin-left: 0.4rem;
+    }
+    .meta { display: grid; grid-template-columns: 1fr 1fr; gap: 0.55rem; margin: 1rem 0; font-size: 0.86rem; }
+    .meta-item { background: rgba(255,255,255,0.03); border-radius: 8px; padding: 0.55rem 0.7rem; }
+    .meta-item label { display: block; color: var(--muted); font-size: 0.72rem; margin-bottom: 0.12rem; }
+    .breakdown { margin-top: 1rem; }
+    .breakdown h3 { font-size: 0.88rem; color: var(--muted); margin-bottom: 0.55rem; }
+    .bar-row { display: flex; align-items: center; gap: 0.55rem; margin-bottom: 0.4rem; font-size: 0.82rem; }
+    .bar-row .label { width: 150px; color: var(--muted); flex-shrink: 0; }
+    .bar-track { flex: 1; height: 8px; background: rgba(255,255,255,0.08); border-radius: 4px; overflow: hidden; }
+    .bar-fill { height: 100%; border-radius: 4px; background: linear-gradient(90deg, #3b82f6, #8b5cf6); transition: width 0.6s ease; }
+    .bar-val { width: 36px; text-align: right; font-variant-numeric: tabular-nums; }
+    .reasons {
+      margin-top: 1rem; padding: 0.85rem; background: rgba(139, 92, 246, 0.08);
+      border-left: 3px solid var(--accent2); border-radius: 0 8px 8px 0; font-size: 0.88rem;
+    }
+    .reasons ul { padding-left: 1.2rem; margin-top: 0.3rem; }
+    .reasons li { margin-bottom: 0.25rem; color: #c4b5fd; }
+    .obs {
+      margin-top: 0.8rem; padding: 0.75rem; background: rgba(59,130,246,0.08);
+      border-radius: 8px; font-size: 0.86rem; color: #93c5fd;
+    }
+    .formula {
+      margin-top: 1rem; font-size: 0.78rem; color: var(--muted);
+      font-family: ui-monospace, monospace; background: rgba(0,0,0,0.25);
+      padding: 0.55rem 0.75rem; border-radius: 6px;
+    }
+    .loading { display: none; text-align: center; padding: 2rem; }
+    .spinner {
+      width: 40px; height: 40px; border: 3px solid var(--border);
+      border-top-color: var(--accent); border-radius: 50%;
+      animation: spin 0.8s linear infinite; margin: 0 auto 1rem;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    footer { text-align: center; margin-top: 2.2rem; color: var(--muted); font-size: 0.8rem; }
+    .std-box { margin-top: 1.8rem; font-size: 0.85rem; color: var(--muted); }
+    .std-box details {
+      background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 1rem 1.25rem;
+    }
+    .std-box summary { cursor: pointer; font-weight: 600; color: var(--text); }
+    .std-box pre {
+      margin-top: 0.75rem; white-space: pre-wrap; font-family: ui-monospace, monospace;
+      font-size: 0.76rem; line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Signature AI Scoring System</h1>
+      <p>Upload Signature and Analyze with AI Agent</p>
+    </header>
+
+    <div class="grid">
+      <div class="card">
+        <h2><span>📤</span> Upload Signature</h2>
+        <div class="dropzone" id="dropzone">
+          <p>Drag & drop image here, or <strong>click to select file</strong></p>
+          <p style="margin-top:0.35rem;font-size:0.8rem;">Supports PNG / JPG / WEBP</p>
+        </div>
+        <input type="file" id="fileInput" accept="image/*" />
+        <div class="preview-box" id="previewBox">
+          <img id="previewImg" alt="Signature Preview" />
+        </div>
+
+
+        <button class="btn" id="analyzeBtn" disabled>
+          <span>🤖</span> Run AI Agent Analysis
+        </button>
+        <button class="btn secondary" id="clearBtn" style="display:none;">Clear</button>
+      </div>
+
+      <div class="card">
+        <h2><span>📊</span> Analysis Results</h2>
+        <div class="result-placeholder" id="placeholder">
+          Upload a signature and click "Run AI Agent Analysis"
+        </div>
+        <div class="loading" id="loading">
+          <div class="spinner"></div>
+          <p>AI Agent is analyzing the signature and evaluating metrics...</p>
+        </div>
+        <div id="resultArea" style="display:none;">
+          <div class="score-ring">
+            <svg width="140" height="140" viewBox="0 0 140 140">
+              <circle cx="70" cy="70" r="58" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="10"/>
+              <circle id="scoreCircle" cx="70" cy="70" r="58" fill="none" stroke="url(#grad)" stroke-width="10"
+                      stroke-linecap="round" stroke-dasharray="364.4" stroke-dashoffset="364.4"/>
+              <defs>
+                <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="0%">
+                  <stop offset="0%" stop-color="#3b82f6"/>
+                  <stop offset="100%" stop-color="#8b5cf6"/>
+                </linearGradient>
+              </defs>
+            </svg>
+            <div class="value">
+              <span id="scoreNum">0</span>
+              <small>Complexity Score</small>
+            </div>
+          </div>
+          <div style="text-align:center;">
+            <div class="badge-group">
+              <span class="badge" id="classBadge">—</span>
+              <span class="badge badge-secondary" id="typeBadge">—</span>
+            </div>
+            <span class="source-tag" id="sourceTag"></span>
+            <div id="scoreLevel" style="color:var(--muted);font-size:0.9rem;margin:0.4rem 0 0.2rem;"></div>
+            <div id="scoreDesc" style="font-size:0.85rem;color:#a5b4fc;"></div>
+          </div>
+          <div class="meta" id="metaGrid"></div>
+          <div class="breakdown" id="breakdownBox" style="display:none;">
+            <h3>Component Breakdown / CV Metrics</h3>
+            <div id="bars"></div>
+          </div>
+          <div class="reasons" id="reasonsBox">
+            <strong>Evaluation Rationale</strong>
+            <ul id="reasonsList"></ul>
+          </div>
+          <div class="obs" id="obsBox" style="display:none;"></div>
+          <div class="formula" id="formulaBox"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="std-box">
+      <details>
+        <summary>📋 Scoring Framework & Standards Guide</summary>
+        <pre>
+[Classification Levels]
+- low_complexity      : Extremely simple signature, minimal strokes or initial (0-30)
+- medium_complexity   : Typical everyday signature with recognizable structure (31-65)
+- high_complexity     : Large number of strokes, rich structural details (66-100)
+
+[Signature Types]
+- english_signature   : Primarily Latin characters / alphabetic cursive
+- chinese_signature   : Primarily Chinese character structures
+- mixed_or_unclear    : Combined characteristics or undetermined language
+- unknown             : Insufficient information (typical for low complexity)
+
+Supported APIs:
+- OpenAI (gpt-4o / gpt-4o-mini)
+- xAI Grok Vision (base_url = https://api.x.ai/v1)
+- OpenAI-compatible endpoints (vLLM, etc.)
+        </pre>
+      </details>
+    </div>
+
+    <footer>
+      Verify Signature · AI Agent Scoring 
+    </footer>
+  </div>
+
+  <script>
+    const dropzone = document.getElementById('dropzone');
+    const fileInput = document.getElementById('fileInput');
+    const previewBox = document.getElementById('previewBox');
+    const previewImg = document.getElementById('previewImg');
+    const analyzeBtn = document.getElementById('analyzeBtn');
+    const clearBtn = document.getElementById('clearBtn');
+    const placeholder = document.getElementById('placeholder');
+    const loading = document.getElementById('loading');
+    const resultArea = document.getElementById('resultArea');
+
+    let currentFile = null;
+
+    // Load saved configurations from sessionStorage if available
+    const savedBase = sessionStorage.getItem('sig_base_url');
+    if (savedBase) document.getElementById('baseUrl').value = savedBase;
+    const savedModel = sessionStorage.getItem('sig_model');
+    if (savedModel) document.getElementById('model').value = savedModel;
+
+    dropzone.addEventListener('click', () => fileInput.click());
+    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
+    dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+    dropzone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropzone.classList.remove('dragover');
+      if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+    });
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files.length) handleFile(fileInput.files[0]);
+    });
+
+    function handleFile(file) {
+      if (!file.type.startsWith('image/')) { alert('Please select a valid image file.'); return; }
+      currentFile = file;
+      previewImg.src = URL.createObjectURL(file);
+      previewBox.style.display = 'block';
+      analyzeBtn.disabled = false;
+      clearBtn.style.display = 'inline-flex';
+      resultArea.style.display = 'none';
+      placeholder.style.display = 'block';
+      loading.style.display = 'none';
+    }
+
+    clearBtn.addEventListener('click', () => {
+      currentFile = null;
+      fileInput.value = '';
+      previewBox.style.display = 'none';
+      analyzeBtn.disabled = true;
+      clearBtn.style.display = 'none';
+      resultArea.style.display = 'none';
+      placeholder.style.display = 'block';
+    });
+
+    analyzeBtn.addEventListener('click', async () => {
+      if (!currentFile) return;
+      const baseUrl = document.getElementById('baseUrl').value.trim();
+      const model = document.getElementById('model').value.trim();
+
+      if (baseUrl) sessionStorage.setItem('sig_base_url', baseUrl);
+      if (model) sessionStorage.setItem('sig_model', model);
+
+      analyzeBtn.disabled = true;
+      placeholder.style.display = 'none';
+      resultArea.style.display = 'none';
+      loading.style.display = 'block';
+
+      const form = new FormData();
+      form.append('file', currentFile);
+      if (baseUrl) form.append('base_url', baseUrl);
+      if (model) form.append('model', model);
+
+      try {
+        const res = await fetch('/api/analyze', { method: 'POST', body: form });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Analysis failed');
+        renderResult(data);
+      } catch (err) {
+        alert('Error: ' + err.message);
+        placeholder.style.display = 'block';
+      } finally {
+        loading.style.display = 'none';
+        analyzeBtn.disabled = false;
+      }
+    });
+
+    function renderResult(data) {
+      resultArea.style.display = 'block';
+      const score = data.complexity_score;
+      document.getElementById('scoreNum').textContent = score;
+      const circle = document.getElementById('scoreCircle');
+      const offset = 364.4 * (1 - score / 100);
+      setTimeout(() => { circle.style.strokeDashoffset = offset; }, 50);
+
+      document.getElementById('classBadge').textContent = data.classification_label || data.classification;
+      document.getElementById('typeBadge').textContent = data.signature_type ? `Type: ${data.signature_type}` : 'Type: N/A';
+      document.getElementById('sourceTag').textContent =
+        data.source === 'vision_llm' ? (data.model || 'Vision LLM') : 'OpenCV Heuristic';
+      document.getElementById('scoreLevel').textContent = data.score_level || '';
+      document.getElementById('scoreDesc').textContent = data.score_description || '';
+
+      // Render Meta Grid
+      let metaHtml = '';
+      if (data.features) {
+        const f = data.features;
+        metaHtml = `
+          <div class="meta-item"><label>Valid Contours</label>${f.num_valid_contours}</div>
+          <div class="meta-item"><label>Ink Coverage</label>${(f.ink_ratio * 100).toFixed(1)}%</div>
+          <div class="meta-item"><label>Edge Density</label>${f.edge_density?.toFixed(3) ?? '-'}</div>
+          <div class="meta-item"><label>Tortuosity</label>${f.tortuosity?.toFixed(3) ?? '-'}</div>
+        `;
+      } else if (data.cv_features) {
+        const f = data.cv_features;
+        metaHtml = `
+          <div class="meta-item"><label>CV Contours</label>${f.num_valid_contours}</div>
+          <div class="meta-item"><label>Ink Coverage</label>${(f.ink_ratio * 100).toFixed(1)}%</div>
+          <div class="meta-item"><label>Edge Density</label>${f.edge_density?.toFixed(3) ?? '-'}</div>
+          <div class="meta-item"><label>Tortuosity</label>${f.tortuosity?.toFixed(3) ?? '-'}</div>
+        `;
+      } else {
+        metaHtml = `
+          <div class="meta-item"><label>Analysis Source</label>${data.source}</div>
+          <div class="meta-item"><label>Note</label>${data.note || 'AI Generated'}</div>
+        `;
+      }
+      metaHtml += `
+        <div class="meta-item"><label>Confidence</label>${((data.confidence || 0) * 100).toFixed(0)}%</div>
+        <div class="meta-item"><label>Timestamp</label>${data.analyzed_at ? data.analyzed_at.slice(11, 19) : '-'}</div>
+      `;
+      document.getElementById('metaGrid').innerHTML = metaHtml;
+
+      // Render Component Scores Breakdown (LLM component_scores or CV breakdown)
+      const compScores = data.component_scores;
+      const cvBreakdown = data.score_breakdown || data.cv_score_breakdown;
+      const breakdownBox = document.getElementById('breakdownBox');
+
+      if (compScores) {
+        breakdownBox.style.display = 'block';
+        const items = [
+          { label: 'Stroke Complexity (40%)', val: compScores.stroke_complexity, max: 100 },
+          { label: 'Character Structure (25%)', val: compScores.character_structure_clarity, max: 100 },
+          { label: 'Connection & Overlap (20%)', val: compScores.connection_overlap, max: 100 },
+          { label: 'Decorative Elements (15%)', val: compScores.decorative_elements, max: 100 },
+        ];
+        document.getElementById('bars').innerHTML = items.map(it => `
+          <div class="bar-row">
+            <span class="label">${it.label}</span>
+            <div class="bar-track"><div class="bar-fill" style="width:${(it.val / it.max * 100)}%"></div></div>
+            <span class="bar-val">${it.val}</span>
+          </div>
+        `).join('');
+      } else if (cvBreakdown) {
+        breakdownBox.style.display = 'block';
+        const items = [
+          { label: 'Contour Score', val: cvBreakdown.contour_score, max: 30 },
+          { label: 'Edge Density', val: cvBreakdown.edge_density_score, max: 25 },
+          { label: 'Tortuosity Score', val: cvBreakdown.tortuosity_score, max: 25 },
+          { label: 'Stroke Score', val: cvBreakdown.stroke_complexity_score, max: 20 },
+        ];
+        document.getElementById('bars').innerHTML = items.map(it => `
+          <div class="bar-row">
+            <span class="label">${it.label}</span>
+            <div class="bar-track"><div class="bar-fill" style="width:${(it.val / it.max * 100)}%"></div></div>
+            <span class="bar-val">${it.val}</span>
+          </div>
+        `).join('');
+      } else {
+        breakdownBox.style.display = 'none';
+      }
+
+      // Render Reasons
+      document.getElementById('reasonsList').innerHTML =
+        (data.reasons || []).map(r => `<li>${r}</li>`).join('') || '<li>None</li>';
+
+      // Render Visual Observations
+      const obsBox = document.getElementById('obsBox');
+      if (data.visual_observations) {
+        obsBox.style.display = 'block';
+        obsBox.innerHTML = '<strong>Visual Observations:</strong> ' + data.visual_observations;
+      } else {
+        obsBox.style.display = 'none';
+      }
+
+      // Formula / Footer note inside result
+      document.getElementById('formulaBox').textContent =
+        data.source === 'vision_llm'
+          ? `Model: ${data.model || ''}  |  Confidence: ${((data.confidence || 0) * 100).toFixed(0)}%`
+          : (cvBreakdown?.formula || '');
+    }
+  </script>
+</body>
+</html>
