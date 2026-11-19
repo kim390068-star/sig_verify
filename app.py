@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
 Signature Analyzer - AI Agent
-上傳電子簽名 → 呼叫 Vision LLM (OpenAI 兼容 API) 進行評分與分類
-同時保留 OpenCV 啟發式作為 fallback / 補充特徵。
+Upload Signature -> Call Vision LLM (OpenAI-compatible API) for scoring & classification.
+Retains OpenCV heuristics as fallback / supplementary features.
 """
+
+from __future__ import annotations
 
 import os
 import base64
@@ -13,25 +15,18 @@ import json
 import re
 from datetime import datetime
 
-# 自動載入 .env 檔案（放在專案根目錄）
 try:
     from dotenv import load_dotenv
     _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     load_dotenv(_env_path)
 except ImportError:
-    pass  # 沒裝 python-dotenv 也沒關係，仍可用系統環境變數
+    pass
 
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
-from PIL import Image
+from PIL import Image, ImageOps
 import numpy as np
 import cv2
-
-# OpenAI 兼容客戶端（支援 OpenAI / xAI / Azure / 本地 vLLM 等）
-try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None
 
 app = Flask(__name__)
 CORS(app)
@@ -40,287 +35,224 @@ UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), "uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024  # 8MB
 
-# ---------------------------------------------------------------------------
-# 配置：優先從 .env / 環境變數讀取，也可在前端 / API 請求中暫時傳入
-# ---------------------------------------------------------------------------
-# 請編輯專案根目錄的 .env 檔案（可參考 .env.example）
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 DEFAULT_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 
 
-# ---------------------------------------------------------------------------
-# 打分標準（給 LLM 的 prompt 與文件一致）
-# ---------------------------------------------------------------------------
 SCORING_PROMPT = """
-You are a professional signature analysis assistant.
-
-Analyze the provided signature image and evaluate its signature complexity and signature type.
-
-========================================
-OBJECTIVE
-========================================
-
-1. Calculate a signature complexity score (0-100).
-2. Classify the signature into one of three complexity levels:
-   - low_complexity
-   - medium_complexity
-   - high_complexity
-3. For medium_complexity and high_complexity signatures, determine whether the signature is primarily:
-   - english_signature
-   - chinese_signature
-   - mixed_or_unclear
-
-========================================
-COMPLEXITY SCORING FRAMEWORK
-========================================
-
-Evaluate the signature using the following four dimensions.
-
-Each dimension must be scored from 0 to 100.
-
-----------------------------------------
-1. Stroke Complexity (40%)
-----------------------------------------
-
-Definition:
-The overall amount of visible pen movement, stroke variation, and directional changes.
-
-Scoring Guide:
-
-0   = single line or minimal mark
-25  = very simple signature with few strokes
-50  = average signature complexity
-75  = numerous strokes and directional changes
-100 = highly intricate, dense, and multi-stroke signature
-
-----------------------------------------
-2. Character Structure Clarity (25%)
-----------------------------------------
-
-Definition:
-The degree to which recognizable character structures are present.
-
-This includes:
-- identifiable letters
-- identifiable Chinese characters
-- consistent writing patterns
-
-Scoring Guide:
-
-0   = no recognizable character structure
-25  = mostly abstract strokes
-50  = partially recognizable characters
-75  = mostly recognizable characters
-100 = highly structured and clearly formed characters
-
-----------------------------------------
-3. Connection & Overlap (20%)
-----------------------------------------
-
-Definition:
-The extent of connected writing, intersections, overlaps, and continuous pen flow.
-
-Scoring Guide:
-
-0   = isolated strokes with no overlap
-25  = minimal connections
-50  = moderate connections
-75  = significant overlap and linking
-100 = extensive overlap, crossing, and interconnected structure
-
-----------------------------------------
-4. Decorative Elements (15%)
-----------------------------------------
-
-Definition:
-The presence of non-essential stylistic features such as:
-
-- loops
-- flourishes
-- long tail strokes
-- ornamental curves
-- artistic embellishments
-
-Scoring Guide:
-
-0   = no decorative elements
-25  = minor decorative features
-50  = noticeable stylistic elements
-75  = substantial embellishment
-100 = highly decorative and artistic signature
-
-========================================
-COMPLEXITY SCORE FORMULA
-========================================
-
-Complexity Score =
-round(
-(Stroke Complexity × 0.40) +
-(Character Structure Clarity × 0.25) +
-(Connection & Overlap × 0.20) +
-(Decorative Elements × 0.15)
-)
-
-========================================
-CLASSIFICATION RULES
-========================================
-
-low_complexity
-
-Complexity Score: 0-30
-
-Characteristics:
-- extremely simple signature
-- contains only one or a few strokes
-- resembles a line, mark, initial, or very basic shape
-- lacks sufficient structure for reliable language identification
-
-----------------------------------------
-
-medium_complexity
-
-Complexity Score: 31-65
-
-Characteristics:
-- typical everyday signature
-- recognizable writing structure
-- moderate amount of personal style
-- limited decorative elements
-
-----------------------------------------
-
-high_complexity
-
-Complexity Score: 66-100
-
-Characteristics:
-- large number of strokes
-- significant overlap or interconnected writing
-- rich structural detail
-- strong artistic or decorative characteristics
-
-========================================
-SIGNATURE TYPE RULES
-========================================
-
-If classification is:
-
-low_complexity
-
-Return:
-
-"signature_type": "unknown"
-
-Reason:
-Insufficient visual information to reliably determine language characteristics.
-
-----------------------------------------
-
-If classification is:
-
-medium_complexity
-or
-high_complexity
-
-Select exactly one:
-
-english_signature
-
-Definition:
-The signature is primarily composed of English letters, cursive writing, Latin-character forms, or recognizable alphabetic structures.
-
-----------------------------------------
-
-chinese_signature
-
-Definition:
-The signature is primarily composed of Chinese character structures, Chinese-style stroke composition, or identifiable Chinese writing patterns.
-
-----------------------------------------
-
-mixed_or_unclear
-
-Definition:
-Language characteristics cannot be determined reliably, or both English and Chinese structural features are present.
-
-========================================
-CONFIDENCE SCORE
-========================================
-
-Return a confidence score between 0 and 1.
-
-Guidelines:
-
-0.90-1.00 = very high confidence
-0.75-0.89 = high confidence
-0.60-0.74 = moderate confidence
-0.40-0.59 = low confidence
-below 0.40 = very uncertain
-
-========================================
-OUTPUT REQUIREMENTS
-========================================
-
-Return ONLY valid JSON.
-
-Do NOT use Markdown.
-
-Do NOT include explanations outside the JSON.
-
-Do NOT include code fences.
-
-Use the exact structure below:
+You are a signature analysis expert. Analyze the signature image and return ONE JSON object only.
+
+SCORING (each 0-100):
+- stroke_complexity (45%): turns, curves, stroke segments
+- character_structure_clarity (25%): readable letters or Chinese characters
+- connection_overlap (25%): joins, crossings, continuous strokes
+- decorative_elements (5%): flourishes, tails, ornament
+
+Overall score = round(0.45*stroke + 0.25*clarity + 0.25*connection + 0.05*decorative)
+classification from score:
+- low_complexity: score <= 60
+- medium_complexity: 61-80
+- high_complexity: score >= 81
+
+signature_type (strict):
+- low_complexity => MUST be "unknown" (never english/chinese for scribbles)
+- chinese_signature: readable Chinese characters (繁體 or 简体)
+- english_signature: readable Latin letters
+- mixed_or_unclear / unknown otherwise
+
+REASONS: exactly 3 short plain-language bullets.
+- high/medium Chinese: try to read the characters, e.g. "Likely reads as 李美娟"
+- high/medium English: try to read the name, e.g. "Reads as Ayman"
+- low: say it is a simple mark; do not invent letters/characters
+
+OUTPUT: raw JSON only. First char { last char }. No markdown, no code fences, no thinking text.
 
 {
-  "classification": "medium_complexity",
-  "signature_type": "english_signature",
-  "complexity_score": 58,
-  "confidence": 0.89,
+  "classification": "high_complexity",
+  "signature_type": "chinese_signature",
+  "complexity_score": 86,
   "component_scores": {
-    "stroke_complexity": 65,
-    "character_structure_clarity": 60,
-    "connection_overlap": 55,
-    "decorative_elements": 35
+    "stroke_complexity": 88,
+    "character_structure_clarity": 85,
+    "connection_overlap": 82,
+    "decorative_elements": 65
   },
-  "score_level": "Medium Complexity",
-  "score_description": "Contains recognizable writing structure with moderate complexity and limited decorative features.",
+  "score_level": "High Complexity",
+  "score_description": "Clear multi-character Chinese signature with connected brush strokes.",
   "reasons": [
-    "Recognizable character structure is present",
-    "Moderate amount of connected strokes",
-    "Limited decorative embellishments"
+    "Likely reads as 李美娟",
+    "Three separate characters in a row with connected strokes",
+    "Last character ends with a long downward stroke"
   ],
-  "visual_observations": "The signature contains continuous handwritten strokes with identifiable character-like structures and moderate overlap."
+  "visual_observations": "Black-ink Chinese signature on white, likely 李美娟, fluid brush-style cursive."
 }
 """
 
 
-def get_client(api_key: str = None, base_url: str = None):
-    """相容介面：有 key 就回傳 True"""
-    key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("XAI_API_KEY")
-    return True if key else None
+def _clamp_int(val, default=50) -> int:
+    try:
+        return max(0, min(100, int(round(float(val)))))
+    except (ValueError, TypeError):
+        return default
+
+
+def _classify_from_score(score: int):
+    """Enforce consistent classification: low <= 60, medium 61-80, high >= 81."""
+    if score <= 60:
+        return ("low_complexity", "Low Complexity", "Low Complexity")
+    elif score <= 80:
+        return ("medium_complexity", "Medium Complexity", "Medium Complexity")
+    else:
+        return ("high_complexity", "High Complexity", "High Complexity")
+
+
+def load_signature_rgb(image_bytes: bytes) -> Image.Image:
+    """
+    Robust loader for PNG/JPG/WEBP (incl. transparent / dark backgrounds).
+    Composites alpha onto pure white and auto-inverts light-on-dark ink.
+    """
+    pil = Image.open(io.BytesIO(image_bytes))
+
+    if pil.mode in ("P", "LA"):
+        pil = pil.convert("RGBA")
+
+    if pil.mode == "RGBA":
+        background = Image.new("RGBA", pil.size, (255, 255, 255, 255))
+        composited = Image.alpha_composite(background, pil)
+        pil = composited.convert("RGB")
+    elif pil.mode != "RGB":
+        pil = pil.convert("RGB")
+
+    arr = np.array(pil)
+    gray = np.mean(arr, axis=2)
+
+    # Very dark overall canvas -> invert
+    if float(np.mean(gray)) < 80:
+        pil = ImageOps.invert(pil)
+        arr = np.array(pil)
+        gray = np.mean(arr, axis=2)
+
+    flat = gray.flatten()
+    if flat.size > 100:
+        lo = float(np.percentile(flat, 10))
+        hi = float(np.percentile(flat, 90))
+        if lo > 100 and hi > 200 and float(np.mean(gray)) < 180:
+            pil = ImageOps.invert(pil)
+
+    return pil
+
+
+def pil_to_cv_bgr(pil: Image.Image) -> np.ndarray:
+    rgb = np.array(pil.convert("RGB"))
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+
+
+def _clean_observation_text(text: str) -> str:
+    """Turn raw model text into a short human-readable observation (never dump JSON)."""
+    if not text:
+        return ""
+    t = text.strip()
+    # Strip code fences
+    t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s*```$", "", t)
+    # If it looks like JSON, try to pull visual_observations field only
+    if "{" in t and "visual_observations" in t:
+        m = re.search(r'"visual_observations"\s*:\s*"((?:[^"\\]|\\.)*)"', t)
+        if m:
+            return bytes(m.group(1), "utf-8").decode("unicode_escape")
+        # Don't show raw JSON blob to users
+        return "Model returned unstructured output; visual detail unavailable."
+    # Collapse whitespace / truncate
+    t = re.sub(r"\s+", " ", t).strip()
+    if len(t) > 400:
+        t = t[:400].rstrip() + "…"
+    return t
+
+
+def _repair_json_string(s: str) -> str:
+    """Best-effort repair for truncated / slightly invalid JSON objects."""
+    s = s.strip()
+    # Remove trailing commas before } or ]
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+    # If truncated mid-string, close the string
+    # Count quotes (naive)
+    if s.count('"') % 2 == 1:
+        s += '"'
+    # Balance braces / brackets
+    open_curly = s.count("{") - s.count("}")
+    open_square = s.count("[") - s.count("]")
+    if open_square > 0:
+        s += "]" * open_square
+    if open_curly > 0:
+        s += "}" * open_curly
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+    return s
+
+
+def _extract_json_object(content: str):
+    """Extract and parse the first JSON object from model content. Returns dict or None."""
+    if not content:
+        return None
+    text = content.strip()
+
+    # 1) Fenced ```json ... ```
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
+    candidates = []
+    if fence:
+        candidates.append(fence.group(1).strip())
+    candidates.append(text)
+
+    # 2) Substring from first { to last }
+    for cand in list(candidates):
+        s = cand.find("{")
+        e = cand.rfind("}")
+        if s != -1 and e != -1 and e > s:
+            candidates.append(cand[s : e + 1])
+        elif s != -1:
+            # truncated — take from first brace to end
+            candidates.append(cand[s:])
+
+    seen = set()
+    for cand in candidates:
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        for variant in (cand, _repair_json_string(cand)):
+            try:
+                obj = json.loads(variant)
+                if isinstance(obj, dict) and (
+                    "complexity_score" in obj
+                    or "component_scores" in obj
+                    or "classification" in obj
+                    or "signature_type" in obj
+                ):
+                    return obj
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+    return None
 
 
 def call_vision_llm(image_bytes: bytes, api_key: str = None, base_url: str = None, model: str = None) -> dict:
-    """使用 pure httpx 直接呼叫 Vision API，避開 OpenAI SDK 連線問題"""
+    """Call Vision API via httpx after normalizing the image."""
     import httpx
 
     key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("XAI_API_KEY")
     if not key:
-        raise ValueError("未提供 API Key。請在 .env 設定 OPENAI_API_KEY，或在前端填入 api_key")
+        raise ValueError("API Key is missing. Set OPENAI_API_KEY in .env or pass api_key.")
 
     model = model or os.getenv("OPENAI_MODEL") or DEFAULT_MODEL
     url_base = (base_url or os.getenv("OPENAI_BASE_URL") or DEFAULT_BASE_URL or "").rstrip("/")
     endpoint = f"{url_base}/chat/completions"
 
-    # 壓縮圖片
-    pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    pil = load_signature_rgb(image_bytes)
     max_side = 1024
     w, h = pil.size
     if max(w, h) > max_side:
         scale = max_side / max(w, h)
         pil = pil.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
     buf = io.BytesIO()
-    pil.save(buf, format="JPEG", quality=90)
+    pil.save(buf, format="JPEG", quality=92)
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
     data_url = f"data:image/jpeg;base64,{b64}"
 
@@ -328,17 +260,27 @@ def call_vision_llm(image_bytes: bytes, api_key: str = None, base_url: str = Non
         "model": model,
         "messages": [
             {
+                "role": "system",
+                "content": (
+                    "You output valid JSON only. No markdown, no code fences, "
+                    "no explanations, no chain-of-thought. Reply starts with { and ends with }."
+                ),
+            },
+            {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": SCORING_PROMPT},
                     {"type": "image_url", "image_url": {"url": data_url}},
                 ],
-            }
+            },
         ],
-        "temperature": 0.2,
-        "max_tokens": 800,
-        "thinking": {"type": "disabled"},  # DeepSeek: 關閉思考模式，直接輸出 JSON
+        "temperature": 0.1,
+        "max_tokens": 600,
+        "response_format": {"type": "json_object"},
     }
+    if "x.ai" in url_base or "grok" in (model or "").lower():
+        payload["thinking"] = {"type": "disabled"}
+
     headers = {
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
@@ -347,126 +289,152 @@ def call_vision_llm(image_bytes: bytes, api_key: str = None, base_url: str = Non
     try:
         with httpx.Client(timeout=httpx.Timeout(90.0, connect=25.0), follow_redirects=True) as client:
             resp = client.post(endpoint, json=payload, headers=headers)
+            # Some providers reject response_format — retry once without it
+            if resp.status_code in (400, 404, 422) and "response_format" in payload:
+                payload.pop("response_format", None)
+                resp = client.post(endpoint, json=payload, headers=headers)
             resp.raise_for_status()
             api_data = resp.json()
     except httpx.ConnectError as e:
-        raise RuntimeError(
-            f"連線失敗 (ConnectError): 無法連到 {url_base}。"
-            f"請確認網路、防火牆或代理。原始錯誤: {str(e)[:200]}"
-        ) from e
+        raise RuntimeError(f"ConnectError: Unable to reach {url_base}. ({str(e)[:200]})") from e
     except httpx.TimeoutException as e:
-        raise RuntimeError(f"請求超時: {str(e)[:200]}") from e
+        raise RuntimeError(f"Request timed out: {str(e)[:200]}") from e
     except httpx.HTTPStatusError as e:
         body = e.response.text[:400] if e.response is not None else ""
-        raise RuntimeError(f"API 回傳錯誤 HTTP {e.response.status_code}: {body}") from e
-    except Exception as e:
-        raise RuntimeError(f"Vision API 呼叫失敗: {type(e).__name__}: {str(e)[:300]}") from e
+        raise RuntimeError(f"API returned HTTP {e.response.status_code}: {body}") from e
 
-    try:
-        msg = api_data["choices"][0]["message"]
-        content = (msg.get("content") or "").strip()
-        # DeepSeek 有時會把主要輸出放在 reasoning_content
-        if not content:
-            content = (msg.get("reasoning_content") or "").strip()
-    except (KeyError, IndexError, TypeError) as e:
-        raise RuntimeError(f"模型回傳格式異常: {str(api_data)[:400]}") from e
-
+    msg = api_data["choices"][0]["message"]
+    content = (msg.get("content") or msg.get("reasoning_content") or "").strip()
     if not content:
-        raise RuntimeError(f"模型回傳空內容。原始 response: {str(api_data)[:400]}")
+        raise RuntimeError(f"Model returned empty content: {str(api_data)[:400]}")
 
-    # 嘗試抽出 JSON（有些模型會包 markdown 或混入推理文字）
-    json_str = content
-    if "```" in content:
-        match = re.search(r"```(?:json)?\s*([\s\S]*?)```", content)
-        if match:
-            json_str = match.group(1).strip()
-    s = json_str.find("{")
-    e = json_str.rfind("}")
-    if s != -1 and e != -1 and e > s:
-        json_str = json_str[s : e + 1]
+    data = _extract_json_object(content)
+    if data is None:
+        # Salvage individual fields with regex before giving up
+        def _grab_int(key, default=None):
+            m = re.search(rf'"{key}"\s*:\s*(\d{{1,3}})', content)
+            if m:
+                return max(0, min(100, int(m.group(1))))
+            return default
 
-    data = None
-    try:
-        data = json.loads(json_str)
-    except json.JSONDecodeError:
-        cls_m = re.search(r'"classification"\s*:\s*"([^"]+)"', content)
-        score_m = re.search(r'"complexity_score"\s*:\s*(\d+)', content)
-        if cls_m or score_m:
-            data = {
-                "classification": cls_m.group(1) if cls_m else "single_signature",
-                "complexity_score": int(score_m.group(1)) if score_m else 50,
-                "confidence": 0.6,
-                "reasons": ["從非完整 JSON 中抽取欄位"],
-                "visual_observations": content[:300],
-            }
-        else:
-            data = {
-                "classification": "single_signature",
-                "complexity_score": 50,
-                "confidence": 0.4,
-                "reasons": ["LLM 回傳格式異常，已使用預設值", content[:180]],
-                "score_level": "中等複雜度",
-                "score_description": "無法完整解析模型輸出",
-                "visual_observations": content[:300],
-                "raw_response": content,
-            }
+        def _grab_str(key, default=""):
+            m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', content)
+            return m.group(1) if m else default
 
-    # 正規化欄位
-    label_map = {
-        "single_signature": "單一簽名 (Single Signature)",
-        "multiple_signatures": "多重簽名 (Multiple Signatures)",
-        "complex_flourish": "華麗花飾簽名 (Complex Flourish)",
-        "simple_print": "簡約/印刷體 (Simple / Print-like)",
-        "illegible_abstract": "難以辨認 / 抽象 (Illegible / Abstract)",
-        "stamp_like": "印章風格 (Stamp-like)",
+        stroke = _grab_int("stroke_complexity")
+        clarity = _grab_int("character_structure_clarity")
+        connection = _grab_int("connection_overlap")
+        decorative = _grab_int("decorative_elements")
+        overall = _grab_int("complexity_score")
+        sig_type = _grab_str("signature_type", "unknown") or "unknown"
+        classification = _grab_str("classification", "")
+        score_level = _grab_str("score_level", "")
+        score_desc = _grab_str("score_description", "") or _grab_str("score_desc", "")
+        visual = _grab_str("visual_observations", "") or _clean_observation_text(content)
+
+        salvaged_any = any(v is not None for v in (stroke, clarity, connection, decorative, overall))
+        data = {
+            "signature_type": sig_type,
+            "classification": classification or None,
+            "complexity_score": overall if overall is not None else 50,
+            "confidence": 0.55 if salvaged_any else 0.35,
+            "component_scores": {
+                "stroke_complexity": stroke if stroke is not None else 50,
+                "character_structure_clarity": clarity if clarity is not None else 50,
+                "connection_overlap": connection if connection is not None else 50,
+                "decorative_elements": decorative if decorative is not None else 50,
+            },
+            "score_level": score_level,
+            "score_description": score_desc,
+            "reasons": [
+                "Partially recovered fields from incomplete model JSON."
+                if salvaged_any else
+                "Model output was not valid JSON; scores defaulted. Retry or switch model."
+            ],
+            "visual_observations": visual,
+            "_parse_failed": True,
+        }
+
+    raw_comp = data.get("component_scores") or {}
+    fallback_val = _clamp_int(data.get("complexity_score", 50))
+    stroke = _clamp_int(raw_comp.get("stroke_complexity"), fallback_val)
+    clarity = _clamp_int(raw_comp.get("character_structure_clarity"), fallback_val)
+    connection = _clamp_int(raw_comp.get("connection_overlap"), fallback_val)
+    decorative = _clamp_int(raw_comp.get("decorative_elements"), fallback_val)
+
+    weighted_score = 0.45 * stroke + 0.25 * clarity + 0.25 * connection + 0.05 * decorative
+    score = max(0, min(100, int(round(weighted_score))))
+    cls, cls_label, default_level = _classify_from_score(score)
+
+    type_map = {
+        "english_signature": "English Signature",
+        "chinese_signature": "Chinese Signature",
+        "mixed_or_unclear": "Mixed / Unclear",
+        "unknown": "Unknown",
     }
-    cls = data.get("classification", "single_signature")
-    score = int(data.get("complexity_score", 50))
-    score = max(0, min(100, score))
+    sig_type = data.get("signature_type", "unknown")
+    if sig_type not in type_map:
+        sig_type = "unknown"
 
-    if not data.get("score_level"):
-        if score < 25:
-            data["score_level"] = "極低複雜度"
-        elif score < 45:
-            data["score_level"] = "低複雜度"
-        elif score < 65:
-            data["score_level"] = "中等複雜度"
-        elif score < 85:
-            data["score_level"] = "高複雜度"
-        else:
-            data["score_level"] = "極高複雜度"
+    # Low complexity marks must not claim English/Chinese script type
+    if cls == "low_complexity":
+        sig_type = "unknown"
 
-    result = {
+    reasons = data.get("reasons") or []
+    if isinstance(reasons, str):
+        reasons = [reasons]
+    # Drop empty reason lines
+    reasons = [str(r).strip() for r in reasons if str(r).strip()]
+    visual = (data.get("visual_observations") or "").strip()
+
+    # Infer chinese_signature from CJK only for medium/high complexity
+    cjk_re = re.compile(r"[\u4e00-\u9fff]")
+    blob_for_type = " ".join([
+        visual or "",
+        " ".join(str(r) for r in reasons),
+        str(data.get("score_description") or ""),
+    ])
+    if (
+        cls != "low_complexity"
+        and sig_type in ("unknown", "mixed_or_unclear")
+        and cjk_re.search(blob_for_type)
+    ):
+        sig_type = "chinese_signature"
+
+    note = "Generated by Vision LLM"
+    if data.get("_parse_failed"):
+        note = "Vision LLM returned non-JSON text; used repaired/default fields. Consider a stronger JSON-capable model."
+
+    return {
         "source": "vision_llm",
         "model": model,
         "classification": cls,
-        "classification_label": label_map.get(cls, cls),
-        "confidence": float(data.get("confidence", 0.8)),
+        "classification_label": cls_label,
+        "signature_type": sig_type,
+        "signature_type_label": type_map.get(sig_type, sig_type),
+        "confidence": float(data.get("confidence", 0.85 if not data.get("_parse_failed") else 0.4)),
         "complexity_score": score,
-        "score_level": data.get("score_level", ""),
+        "component_scores": {
+            "stroke_complexity": stroke,
+            "character_structure_clarity": clarity,
+            "connection_overlap": connection,
+            "decorative_elements": decorative,
+        },
+        "score_level": data.get("score_level") or default_level,
         "score_description": data.get("score_description", ""),
-        "reasons": data.get("reasons", []),
-        "visual_observations": data.get("visual_observations", ""),
+        "reasons": reasons,
+        "visual_observations": visual if visual and not visual.strip().startswith("{") else _clean_observation_text(visual or ""),
         "analyzed_at": datetime.utcnow().isoformat() + "Z",
-        "note": "結果由 Vision LLM 生成",
+        "note": note,
     }
-    return result
 
 
 def analyze_signature_cv(image_bytes: bytes) -> dict:
-    """OpenCV 啟發式 fallback / 補充特徵（保留原邏輯）"""
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-
+    """OpenCV heuristic fallback with improved geometry scoring and richer reasons."""
+    pil = load_signature_rgb(image_bytes)
+    img = pil_to_cv_bgr(pil)
     h, w = img.shape[:2]
-    original_size = {"width": w, "height": h}
-
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    if np.mean(gray) < 127:
-        gray = 255 - gray
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
     binary = cv2.adaptiveThreshold(
@@ -480,8 +448,8 @@ def analyze_signature_cv(image_bytes: bytes) -> dict:
     total_pixels = h * w
     ink_ratio = fg_pixels / total_pixels if total_pixels > 0 else 0
 
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    min_area = max(20, (h * w) * 0.00005)
+    contours, hierarchy = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    min_area = max(15, (h * w) * 0.00003)
     valid_contours = [c for c in contours if cv2.contourArea(c) >= min_area]
     num_contours = len(valid_contours)
 
@@ -490,115 +458,115 @@ def analyze_signature_cv(image_bytes: bytes) -> dict:
 
     if valid_contours:
         all_pts = np.vstack(valid_contours)
-        x, y, bw, bh = cv2.boundingRect(all_pts)
-        bbox_area = bw * bh
-        fill_ratio = total_area / bbox_area if bbox_area > 0 else 0
+        _, _, bw, bh = cv2.boundingRect(all_pts)
+        bbox_area = max(1, bw * bh)
+        fill_ratio = total_area / bbox_area
         aspect = bw / bh if bh > 0 else 1.0
+        span_ratio = bw / max(1, w)
     else:
-        x = y = bw = bh = 0
         fill_ratio = 0
         aspect = 1.0
-
-    edges = cv2.Canny(gray, 50, 150)
-    edge_pixels = int(np.sum(edges > 0))
-    edge_density = edge_pixels / fg_pixels if fg_pixels > 0 else 0
+        span_ratio = 0
+        bw = bh = 0
 
     if total_area > 0:
         circularity = (4 * math.pi * total_area) / (total_perimeter ** 2 + 1e-6)
-        tortuosity = max(0, 1.0 - circularity)
+        tortuosity = max(0.0, 1.0 - min(1.0, circularity))
     else:
-        tortuosity = 0
+        tortuosity = 0.0
 
     poly_vertices = 0
     for c in valid_contours:
-        epsilon = 0.01 * cv2.arcLength(c, True)
+        epsilon = 0.008 * cv2.arcLength(c, True)
         approx = cv2.approxPolyDP(c, epsilon, True)
         poly_vertices += len(approx)
 
-    contour_score = min(30.0, 12.0 * math.log2(1 + num_contours))
-    edge_score = min(25.0, edge_density * 70.0)
-    tort_score = min(25.0, tortuosity * 35.0)
-    stroke_score = min(20.0, 6.0 * math.log2(1 + poly_vertices / max(1, num_contours)))
-    complexity_score = round(min(100.0, contour_score + edge_score + tort_score + stroke_score), 1)
+    internal = 0
+    if hierarchy is not None and len(hierarchy) > 0:
+        for i, hinfo in enumerate(hierarchy[0]):
+            if hinfo[3] >= 0 and cv2.contourArea(contours[i]) >= min_area:
+                internal += 1
 
-    reasons = []
-    classification = "single_signature"
-    confidence = 0.7
+    stroke = _clamp_int(min(100, poly_vertices * 1.35 + num_contours * 6 + tortuosity * 25))
+    clarity = _clamp_int(min(100, num_contours * 12 + internal * 8 + fill_ratio * 55 + span_ratio * 25))
+    connection = _clamp_int(min(100, tortuosity * 70 + min(30, total_perimeter / max(1, (bw + bh)) * 8)))
+    decorative = _clamp_int(
+        min(100, abs(aspect - 2.2) * 14 + tortuosity * 35 + max(0, (total_perimeter / (total_area + 1)) - 0.4) * 20)
+    )
 
-    if num_contours == 0 or fg_pixels < 50:
-        classification = "illegible_abstract"
-        confidence = 0.9
-        reasons.append("幾乎偵測不到有效筆跡")
-    elif num_contours >= 4 and fill_ratio < 0.25:
-        classification = "multiple_signatures"
-        confidence = 0.75
-        reasons.append(f"偵測到 {num_contours} 個相對獨立的筆跡區域")
-    elif tortuosity > 0.55 and poly_vertices / max(1, num_contours) > 12:
-        classification = "complex_flourish"
-        confidence = 0.8
-        reasons.append("線條曲折度高且多邊形頂點多，呈現華麗花飾特徵")
-    elif num_contours <= 2 and tortuosity < 0.25 and poly_vertices < 15:
-        classification = "simple_print"
-        confidence = 0.7
-        reasons.append("筆畫極簡、曲折度低，接近印刷或極簡風格")
-    elif fill_ratio > 0.45 and edge_density < 0.35:
-        classification = "stamp_like"
-        confidence = 0.65
-        reasons.append("高填充率與相對封閉區域，接近印章風格")
-    else:
-        classification = "single_signature"
-        confidence = 0.75
-        reasons.append("單一主要連貫筆跡區域，符合一般簽名特徵")
+    if num_contours >= 3 and span_ratio > 0.45:
+        stroke = min(100, stroke + 8)
+        clarity = min(100, clarity + 10)
+    if poly_vertices >= 40:
+        stroke = min(100, stroke + 6)
 
-    label_map = {
-        "single_signature": "單一簽名 (Single Signature)",
-        "multiple_signatures": "多重簽名 (Multiple Signatures)",
-        "complex_flourish": "華麗花飾簽名 (Complex Flourish)",
-        "simple_print": "簡約/印刷體 (Simple / Print-like)",
-        "illegible_abstract": "難以辨認 / 抽象 (Illegible / Abstract)",
-        "stamp_like": "印章風格 (Stamp-like)",
-    }
+    weighted_score = 0.45 * stroke + 0.25 * clarity + 0.25 * connection + 0.05 * decorative
+    score = max(0, min(100, int(round(weighted_score))))
+    cls, cls_label, default_level = _classify_from_score(score)
 
-    if complexity_score < 25:
-        score_level, score_desc = "極低複雜度", "筆畫非常簡單，幾乎直線或少數曲線"
-    elif complexity_score < 45:
-        score_level, score_desc = "低複雜度", "一般日常簽名，線條相對順暢"
-    elif complexity_score < 65:
-        score_level, score_desc = "中等複雜度", "具有一定變化與個人特色的簽名"
-    elif complexity_score < 85:
-        score_level, score_desc = "高複雜度", "華麗或筆畫豐富，具備明顯花飾或多重迴圈"
-    else:
-        score_level, score_desc = "極高複雜度", "高度裝飾性，線條極度曲折或密集"
+    sig_type = "unknown"
+    sig_type_label = "Unknown (CV Fallback)"
+    # Only guess script type for medium/high complexity geometry
+    if score > 60:
+        if num_contours >= 2 and aspect > 1.6 and span_ratio > 0.5:
+            if fill_ratio > 0.12 and internal >= 1:
+                sig_type = "mixed_or_unclear"
+                sig_type_label = "Mixed / Unclear (CV estimate)"
+        elif num_contours == 1 and tortuosity > 0.55 and aspect > 2.0:
+            sig_type = "english_signature"
+            sig_type_label = "English Signature (CV estimate)"
+
+    reasons = [
+        f"Detected {num_contours} stroke region(s), {poly_vertices} contour vertices, ink ratio {ink_ratio:.3f}.",
+    ]
+    if internal:
+        reasons.append(f"Found {internal} internal hole/structure region(s) suggesting character complexity.")
+    if tortuosity > 0.5:
+        reasons.append("High stroke tortuosity indicates curved / connected writing paths.")
+    if span_ratio > 0.5:
+        reasons.append("Wide horizontal span consistent with a multi-character or full-name signature.")
+    if score >= 81:
+        reasons.append("Geometric density maps into High Complexity under the weighted rubric.")
+    elif score <= 60:
+        reasons.append("Limited structure — likely a simple mark or sparse strokes under pure geometry.")
+
+    visual = (
+        f"OpenCV view: {num_contours} region(s), bbox span {span_ratio:.0%} of width, "
+        f"tortuosity {tortuosity:.2f}, fill {fill_ratio:.2f}. "
+        f"Dark-ink-on-white preprocessing applied before measurement."
+    )
 
     return {
         "source": "opencv_heuristic",
-        "classification": classification,
-        "classification_label": label_map.get(classification, classification),
-        "confidence": round(confidence, 2),
-        "complexity_score": complexity_score,
-        "score_level": score_level,
-        "score_description": score_desc,
+        "classification": cls,
+        "classification_label": cls_label,
+        "signature_type": sig_type,
+        "signature_type_label": sig_type_label,
+        "confidence": 0.55,
+        "complexity_score": score,
+        "component_scores": {
+            "stroke_complexity": stroke,
+            "character_structure_clarity": clarity,
+            "connection_overlap": connection,
+            "decorative_elements": decorative,
+        },
+        "score_level": default_level,
+        "score_description": "Geometric estimate via OpenCV fallback (Vision LLM not used).",
         "reasons": reasons,
+        "visual_observations": visual,
         "features": {
             "num_valid_contours": num_contours,
             "ink_ratio": round(ink_ratio, 4),
-            "edge_density": round(edge_density, 4),
             "tortuosity": round(tortuosity, 4),
             "poly_vertices": poly_vertices,
-            "bounding_box": {"x": int(x), "y": int(y), "w": int(bw), "h": int(bh)},
-            "aspect_ratio": round(aspect, 3),
-            "fill_ratio": round(fill_ratio, 4),
-            "image_size": original_size,
+            "span_ratio": round(span_ratio, 3),
+            "internal_regions": internal,
         },
         "score_breakdown": {
-            "contour_score": round(contour_score, 1),
-            "edge_density_score": round(edge_score, 1),
-            "tortuosity_score": round(tort_score, 1),
-            "stroke_complexity_score": round(stroke_score, 1),
-            "formula": "min(100, contour(0-30) + edge(0-25) + tortuosity(0-25) + stroke(0-20))",
+            "formula": "round(0.45*stroke + 0.25*clarity + 0.25*connection + 0.05*decorative)"
         },
         "analyzed_at": datetime.utcnow().isoformat() + "Z",
-        "note": "本結果由計算機視覺啟發式規則產生（fallback）",
+        "note": "Generated by OpenCV heuristic fallback — set OPENAI_API_KEY / XAI_API_KEY for Vision LLM.",
     }
 
 
@@ -609,18 +577,13 @@ def index():
 
 @app.route("/api/analyze", methods=["POST"])
 def api_analyze():
-    """
-    支援兩種模式：
-    1. 有 API Key → 呼叫真實 Vision LLM
-    2. 無 API Key → 使用 OpenCV 啟發式
-    """
-    if "file" not in request.files and "image" not in request.form and (not request.is_json or "image" not in (request.json or {})):
-        return jsonify({"error": "請上傳簽名圖片 (file 欄位或 base64 image)"}), 400
+    if "file" not in request.files and "image" not in request.form and (
+        not request.is_json or "image" not in (request.json or {})
+    ):
+        return jsonify({"error": "Please upload a signature image."}), 400
 
     image_bytes = None
     filename = "signature.png"
-
-    # 可選參數
     api_key = None
     base_url = None
     model = None
@@ -634,12 +597,12 @@ def api_analyze():
         force_cv = data.get("force_cv", False)
         if "image" in data:
             raw = data["image"]
-            if raw.startswith("data:"):
+            if isinstance(raw, str) and raw.startswith("data:"):
                 raw = raw.split(",", 1)[1]
             try:
                 image_bytes = base64.b64decode(raw)
             except Exception:
-                return jsonify({"error": "無效的 base64 圖片"}), 400
+                return jsonify({"error": "Invalid base64 image."}), 400
     else:
         api_key = request.form.get("api_key") or request.headers.get("X-API-Key")
         base_url = request.form.get("base_url")
@@ -649,7 +612,7 @@ def api_analyze():
         if "file" in request.files:
             f = request.files["file"]
             if f.filename == "":
-                return jsonify({"error": "未選擇檔案"}), 400
+                return jsonify({"error": "No file selected."}), 400
             filename = f.filename
             image_bytes = f.read()
         elif "image" in request.form:
@@ -659,51 +622,63 @@ def api_analyze():
             try:
                 image_bytes = base64.b64decode(raw)
             except Exception:
-                return jsonify({"error": "無效的 base64 圖片"}), 400
+                return jsonify({"error": "Invalid base64 image."}), 400
 
     if not image_bytes:
-        return jsonify({"error": "無法讀取圖片"}), 400
+        return jsonify({"error": "Unable to read image."}), 400
 
-    # 儲存上傳
     try:
         safe_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{filename}"
-        path = os.path.join(UPLOAD_FOLDER, safe_name)
-        with open(path, "wb") as out:
+        with open(os.path.join(UPLOAD_FOLDER, safe_name), "wb") as out:
             out.write(image_bytes)
     except Exception:
         pass
 
     try:
-        # 優先使用真實 AI
-        use_llm = not force_cv and (api_key or os.getenv("OPENAI_API_KEY") or os.getenv("XAI_API_KEY"))
+        env_key = os.getenv("OPENAI_API_KEY") or os.getenv("XAI_API_KEY")
+        use_llm = not force_cv and bool(api_key or env_key)
 
         if use_llm:
-            result = call_vision_llm(image_bytes, api_key=api_key, base_url=base_url, model=model)
-            # 同時附上 CV 特徵作為補充（可選）
             try:
-                cv_result = analyze_signature_cv(image_bytes)
-                result["cv_features"] = cv_result.get("features")
-                result["cv_score_breakdown"] = cv_result.get("score_breakdown")
-            except Exception:
-                pass
+                result = call_vision_llm(
+                    image_bytes, api_key=api_key, base_url=base_url, model=model
+                )
+                try:
+                    cv_result = analyze_signature_cv(image_bytes)
+                    result["cv_features"] = cv_result.get("features")
+                except Exception:
+                    pass
+            except Exception as e:
+                llm_error = str(e)
+                result = analyze_signature_cv(image_bytes)
+                result["llm_error"] = llm_error
+                result["note"] = f"Vision LLM failed ({llm_error[:120]}); used OpenCV fallback."
         else:
             result = analyze_signature_cv(image_bytes)
+            if not env_key and not api_key:
+                result["note"] = (
+                    "No API key configured (OPENAI_API_KEY / XAI_API_KEY). "
+                    "Using OpenCV geometric fallback only."
+                )
 
-        # 預覽圖
-        nparr = np.frombuffer(image_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img is not None:
+        try:
+            pil = load_signature_rgb(image_bytes)
             max_side = 480
-            h, w = img.shape[:2]
+            w, h = pil.size
             scale = min(1.0, max_side / max(h, w))
             if scale < 1.0:
-                img = cv2.resize(img, (int(w * scale), int(h * scale)))
-            _, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-            result["preview_base64"] = "data:image/jpeg;base64," + base64.b64encode(buf).decode()
+                pil = pil.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            pil.save(buf, format="JPEG", quality=88)
+            result["preview_base64"] = (
+                "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+            )
+        except Exception:
+            pass
 
         return jsonify(result)
     except Exception as e:
-        return jsonify({"error": f"分析失敗: {str(e)}"}), 500
+        return jsonify({"error": f"Analysis failed: {str(e)}"}), 500
 
 
 @app.route("/api/health")
@@ -719,11 +694,4 @@ def health():
 
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("Signature Analyzer (Vision LLM + OpenCV)")
-    print("  預設模型:", DEFAULT_MODEL)
-    print("  Base URL:", DEFAULT_BASE_URL)
-    print("  API Key 已設定:" , bool(os.getenv("OPENAI_API_KEY") or os.getenv("XAI_API_KEY")))
-    print("  啟動於 http://0.0.0.0:5000")
-    print("=" * 60)
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
